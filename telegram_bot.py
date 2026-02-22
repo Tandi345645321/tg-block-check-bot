@@ -16,19 +16,17 @@ import matplotlib.pyplot as plt
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ===== ТОКЕН =====
 TOKEN = os.environ.get('TELEGRAM_TOKEN', '8403715390:AAEdo8Tbl6Ns70X27CbLGBxjg5S_u3ctwzY')
-# =================
-
 logger = logging.getLogger(__name__)
 
+# Страны, которые поддерживает check-host.net (выбираем ближайшие к нашим)
 LOCATIONS = [
-    {"country": "RU", "name": "🇷🇺 Россия"},
-    {"country": "US", "name": "🇺🇸 США"},
-    {"country": "DE", "name": "🇩🇪 Германия"},
-    {"country": "JP", "name": "🇯🇵 Япония"},
-    {"country": "BR", "name": "🇧🇷 Бразилия"},
-    {"country": "AU", "name": "🇦🇺 Австралия"},
+    {"code": "RU", "name": "🇷🇺 Россия", "node": "ru"},
+    {"code": "US", "name": "🇺🇸 США", "node": "us"},
+    {"code": "DE", "name": "🇩🇪 Германия", "node": "de"},
+    {"code": "JP", "name": "🇯🇵 Япония", "node": "jp"},
+    {"code": "BR", "name": "🇧🇷 Бразилия", "node": "br"},
+    {"code": "AU", "name": "🇦🇺 Австралия", "node": "au"},
 ]
 
 BLOCKED_FILE = "/tmp/blocked.json"
@@ -53,115 +51,103 @@ FRIEND_GREETING = "АХУЕТЬ ЭТО ЖЕ АРТЁМ ЖАДОВ, ЛЮБИМЫ�
 
 friend_greeted = set()
 
-# ---------- Исправленная функция проверки ----------
+# ---------- Новая функция проверки через check-host.net ----------
 async def check_site_global(domain: str):
     results = []
-    for loc in LOCATIONS:
-        # Пробуем сначала GET (самый надёжный)
-        payload = {
-            "type": "http",
-            "target": domain,
-            "locations": [{"country": loc["country"]}],
-            "measurementOptions": {
-                "protocol": "HTTPS",
-                "port": 443,
-                "request": {
-                    "path": "/",
-                    "method": "GET",          # GET вместо HEAD
-                    "headers": {
-                        "User-Agent": "Mozilla/5.0 (compatible; GlobalpingBot/1.0)"
-                    },
-                    "followRedirects": True    # Следовать редиректам
-                },
-            },
-        }
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (compatible; TelegramBot/1.0)',
+        'Accept': 'application/json'
+    }
 
+    for loc in LOCATIONS:
+        # 1. Создаём проверку
+        check_url = f"https://check-host.net/check-http?host=https://{domain}&max_nodes=1&node={loc['node']}"
         try:
-            # Создаём тест
-            resp = requests.post(
-                "https://api.globalping.io/v1/measurements",
-                json=payload,
-                timeout=15,
-            )
-            if resp.status_code != 202:
+            resp = requests.get(check_url, headers=headers, timeout=15)
+            if resp.status_code != 200:
                 results.append({
-                    "country": loc["country"],
-                    "status": "⚠️ Ошибка создания",
+                    "country": loc["code"],
+                    "status": "⚠️ Ошибка API",
                     "response_time": 0,
-                    "error": f"HTTP {resp.status_code}",
+                    "error": f"HTTP {resp.status_code}"
                 })
                 continue
 
             data = resp.json()
-            measurement_id = data["id"]
+            if 'ok' not in data or data['ok'] != 1:
+                results.append({
+                    "country": loc["code"],
+                    "status": "⚠️ Ошибка создания",
+                    "response_time": 0,
+                    "error": "API вернул ошибку"
+                })
+                continue
 
-            # Ждём результатов (увеличим время ожидания)
-            time.sleep(4)
+            # Получаем ID проверки
+            check_id = data['request_id']
+            permanent_link = data['permanent_link']
 
-            # Получаем результаты
-            result_resp = requests.get(
-                f"https://api.globalping.io/v1/measurements/{measurement_id}",
-                timeout=10,
-            )
+            # 2. Ждём 5 секунд (даём время на выполнение)
+            time.sleep(5)
+
+            # 3. Получаем результаты
+            result_url = f"https://check-host.net/check-result/{check_id}"
+            result_resp = requests.get(result_url, headers=headers, timeout=15)
+
             if result_resp.status_code != 200:
                 results.append({
-                    "country": loc["country"],
+                    "country": loc["code"],
                     "status": "⚠️ Нет результатов",
                     "response_time": 0,
-                    "error": f"HTTP {result_resp.status_code}",
+                    "error": f"HTTP {result_resp.status_code}"
                 })
                 continue
 
             result_data = result_resp.json()
 
-            if "results" in result_data and len(result_data["results"]) > 0:
-                probe_result = result_data["results"][0]
-
-                # Проверяем статус завершения
-                if probe_result.get("status") == "finished":
-                    # Проверяем, был ли успешный HTTP-ответ (2xx или 3xx)
-                    http_status = probe_result.get("response", {}).get("statusCode")
-                    if http_status and 200 <= http_status < 400:
+            # Парсим результат
+            if loc['node'] in result_data and result_data[loc['node']]:
+                node_result = result_data[loc['node']][0]
+                if node_result and isinstance(node_result, list) and len(node_result) > 0:
+                    # Пример результата: [0, 123.456, "OK", ...]
+                    # 0 — успех, время отклика в мс
+                    if node_result[0] == 0:
                         status = "✅ Доступен"
+                        response_time = node_result[1] if len(node_result) > 1 else 0
                     else:
                         status = "❌ Недоступен"
+                        response_time = 0
                 else:
                     status = "❌ Недоступен"
-
-                timings = probe_result.get("timings", {})
-                response_time = timings.get("total", 0)
-
-                results.append({
-                    "country": loc["country"],
-                    "status": status,
-                    "response_time": response_time,
-                    "error": probe_result.get("error"),
-                })
+                    response_time = 0
             else:
-                results.append({
-                    "country": loc["country"],
-                    "status": "⚠️ Нет данных",
-                    "response_time": 0,
-                    "error": "Пустой ответ",
-                })
+                status = "❌ Недоступен"
+                response_time = 0
+
+            results.append({
+                "country": loc["code"],
+                "status": status,
+                "response_time": response_time,
+                "error": None
+            })
 
         except Exception as e:
-            logger.error(f"Ошибка при проверке {loc['country']}: {e}")
+            logger.error(f"Ошибка при проверке {loc['code']}: {e}")
             results.append({
-                "country": loc["country"],
+                "country": loc["code"],
                 "status": "⚠️ Ошибка",
                 "response_time": 0,
-                "error": str(e)[:50],
+                "error": str(e)[:50]
             })
 
     return results
 
-# ---------- Остальные функции без изменений ----------
+# ---------- Функция создания графика (без изменений, но обновим названия) ----------
 def create_status_chart(results, domain, is_rkn_blocked=False):
     countries = []
     status_colors = []
     response_times = []
-    country_names = {loc["country"]: loc["name"] for loc in LOCATIONS}
+    country_names = {loc["code"]: loc["name"] for loc in LOCATIONS}
     for r in results:
         country = country_names.get(r["country"], r["country"])
         countries.append(country)
@@ -223,7 +209,7 @@ def analyze_blocking(results):
     other_available = any("✅" in r["status"] for r in other_results)
     if not ru_available and other_available:
         working = [r["country"] for r in other_results if "✅" in r["status"]]
-        country_names = {loc["country"]: loc["name"] for loc in LOCATIONS}
+        country_names = {loc["code"]: loc["name"] for loc in LOCATIONS}
         working_names = [country_names.get(c, c) for c in working]
         return (
             f"⚠️ **ВЕРОЯТНАЯ БЛОКИРОВКА В РОССИИ**\n"
@@ -259,7 +245,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rkn_blocked = is_blocked(domain)
         chart_buf = create_status_chart(results, domain, rkn_blocked)
 
-        country_names = {loc["country"]: loc["name"] for loc in LOCATIONS}
+        country_names = {loc["code"]: loc["name"] for loc in LOCATIONS}
         text = f"📊 **Результаты проверки {domain}**\n\n"
         for r in results:
             name = country_names.get(r["country"], r["country"])
@@ -296,7 +282,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/admin — админ-меню (для создателя)"
     )
 
-# ---------- Админские команды ----------
+# ---------- Админские команды (без изменений) ----------
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user.username or user.username.lower() != CREATOR_USERNAME.lower():

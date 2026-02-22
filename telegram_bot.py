@@ -17,13 +17,11 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ===== ТОКЕН =====
-# Берём токен из переменной окружения (так безопаснее)
 TOKEN = os.environ.get('TELEGRAM_TOKEN', '8403715390:AAEdo8Tbl6Ns70X27CbLGBxjg5S_u3ctwzY')
 # =================
 
 logger = logging.getLogger(__name__)
 
-# Список стран для проверки
 LOCATIONS = [
     {"country": "RU", "name": "🇷🇺 Россия"},
     {"country": "US", "name": "🇺🇸 США"},
@@ -33,7 +31,6 @@ LOCATIONS = [
     {"country": "AU", "name": "🇦🇺 Австралия"},
 ]
 
-# Файл для хранения списка заблокированных доменов (используем /tmp, так как это единственная папка для записи на Render)
 BLOCKED_FILE = "/tmp/blocked.json"
 
 def load_blocked():
@@ -50,17 +47,17 @@ def save_blocked(blocked_list):
 def is_blocked(domain):
     return domain in load_blocked()
 
-# Константы для админа и друга
 CREATOR_USERNAME = "hfvjw"
 FRIEND_USERNAME = "Nonkap"
 FRIEND_GREETING = "АХУЕТЬ ЭТО ЖЕ АРТЁМ ЖАДОВ, ЛЮБИМЫЙ ИЗ ЛЮБИМЫХ, СПАСИБО ЧТО ТЫ ЕСТЬ, ТЕБЯ МЫ ВСЕ ЛЮБИМ, ПОЛЬЗУЙСЯ НА ЗДОРОВЬЕ, Я ТЕБЯ ЛЮБЛЮ"
 
 friend_greeted = set()
 
-# ---------- Основные функции бота ----------
+# ---------- Исправленная функция проверки ----------
 async def check_site_global(domain: str):
     results = []
     for loc in LOCATIONS:
+        # Пробуем сначала GET (самый надёжный)
         payload = {
             "type": "http",
             "target": domain,
@@ -68,10 +65,19 @@ async def check_site_global(domain: str):
             "measurementOptions": {
                 "protocol": "HTTPS",
                 "port": 443,
-                "request": {"path": "/", "method": "HEAD"},
+                "request": {
+                    "path": "/",
+                    "method": "GET",          # GET вместо HEAD
+                    "headers": {
+                        "User-Agent": "Mozilla/5.0 (compatible; GlobalpingBot/1.0)"
+                    },
+                    "followRedirects": True    # Следовать редиректам
+                },
             },
         }
+
         try:
+            # Создаём тест
             resp = requests.post(
                 "https://api.globalping.io/v1/measurements",
                 json=payload,
@@ -85,9 +91,14 @@ async def check_site_global(domain: str):
                     "error": f"HTTP {resp.status_code}",
                 })
                 continue
+
             data = resp.json()
             measurement_id = data["id"]
-            time.sleep(3)
+
+            # Ждём результатов (увеличим время ожидания)
+            time.sleep(4)
+
+            # Получаем результаты
             result_resp = requests.get(
                 f"https://api.globalping.io/v1/measurements/{measurement_id}",
                 timeout=10,
@@ -100,12 +111,26 @@ async def check_site_global(domain: str):
                     "error": f"HTTP {result_resp.status_code}",
                 })
                 continue
+
             result_data = result_resp.json()
+
             if "results" in result_data and len(result_data["results"]) > 0:
                 probe_result = result_data["results"][0]
-                status = "✅ Доступен" if probe_result.get("status") == "finished" else "❌ Недоступен"
+
+                # Проверяем статус завершения
+                if probe_result.get("status") == "finished":
+                    # Проверяем, был ли успешный HTTP-ответ (2xx или 3xx)
+                    http_status = probe_result.get("response", {}).get("statusCode")
+                    if http_status and 200 <= http_status < 400:
+                        status = "✅ Доступен"
+                    else:
+                        status = "❌ Недоступен"
+                else:
+                    status = "❌ Недоступен"
+
                 timings = probe_result.get("timings", {})
                 response_time = timings.get("total", 0)
+
                 results.append({
                     "country": loc["country"],
                     "status": status,
@@ -119,6 +144,7 @@ async def check_site_global(domain: str):
                     "response_time": 0,
                     "error": "Пустой ответ",
                 })
+
         except Exception as e:
             logger.error(f"Ошибка при проверке {loc['country']}: {e}")
             results.append({
@@ -127,8 +153,10 @@ async def check_site_global(domain: str):
                 "response_time": 0,
                 "error": str(e)[:50],
             })
+
     return results
 
+# ---------- Остальные функции без изменений ----------
 def create_status_chart(results, domain, is_rkn_blocked=False):
     countries = []
     status_colors = []
@@ -144,22 +172,22 @@ def create_status_chart(results, domain, is_rkn_blocked=False):
             status_colors.append("#e74c3c")
         else:
             status_colors.append("#f39c12")
-    
+
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
     fig.suptitle(f"🌐 Доступность сайта {domain}", fontsize=16, fontweight='bold')
-    
+
     ax1.bar(countries, [1] * len(countries), color=status_colors, alpha=0.8, edgecolor='black', linewidth=1)
     ax1.set_ylim(0, 1.5)
     ax1.set_ylabel("Статус", fontsize=12)
     ax1.set_title("🟢 доступен  🔴 недоступен  🟠 ошибка проверки", fontsize=11)
     ax1.tick_params(axis="x", rotation=45)
     ax1.set_yticks([])
-    
+
     bars = ax2.bar(countries, response_times, color="#3498db", alpha=0.8, edgecolor='black', linewidth=1)
     ax2.set_ylabel("Время отклика (сек)", fontsize=12)
     ax2.set_title("⏱️ Время загрузки (только для доступных сайтов)", fontsize=11)
     ax2.tick_params(axis="x", rotation=45)
-    
+
     for bar, t in zip(bars, response_times):
         if t > 0:
             ax2.text(
@@ -168,13 +196,13 @@ def create_status_chart(results, domain, is_rkn_blocked=False):
                 f"{t:.2f}с",
                 ha="center", va="bottom", fontsize=10, fontweight='bold'
             )
-    
+
     if is_rkn_blocked:
-        fig.text(0.5, 0.01, "⚠️ Данный сайт находится в реестре заблокированных РКН", 
+        fig.text(0.5, 0.01, "⚠️ Данный сайт находится в реестре заблокированных РКН",
                  ha="center", fontsize=12, color='red', fontweight='bold')
-    
+
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    
+
     buf = io.BytesIO()
     plt.savefig(buf, format="png", dpi=120, bbox_inches='tight')
     buf.seek(0)
@@ -217,20 +245,20 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Укажите домен. Например:\n/check example.com\n/check google.ru"
         )
         return
-    
+
     domain = context.args[0].lower().strip()
     domain = domain.replace("https://", "").replace("http://", "").split("/")[0]
-    
+
     status_msg = await update.message.reply_text(
         f"🔍 Проверяю {domain}... Это займёт около 30 секунд"
     )
-    
+
     try:
         results = await check_site_global(domain)
         analysis = analyze_blocking(results)
         rkn_blocked = is_blocked(domain)
         chart_buf = create_status_chart(results, domain, rkn_blocked)
-        
+
         country_names = {loc["country"]: loc["name"] for loc in LOCATIONS}
         text = f"📊 **Результаты проверки {domain}**\n\n"
         for r in results:
@@ -241,7 +269,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if rkn_blocked:
             text += "\n\n⚠️ **Этот сайт находится в реестре заблокированных РКН**"
         text += f"\n\n🕒 Проверка: {datetime.now().strftime('%H:%M:%S')}"
-        
+
         await status_msg.delete()
         await update.message.reply_photo(
             photo=chart_buf,
@@ -255,14 +283,13 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     username = user.username
-    
-    # Приветствие для друга
+
     if username and username.lower() == FRIEND_USERNAME.lower():
         if user.id not in friend_greeted:
             friend_greeted.add(user.id)
             await update.message.reply_text(FRIEND_GREETING)
             return
-    
+
     await update.message.reply_text(
         "👋 Привет! Я бот для проверки доступности сайтов.\n\n"
         "/check <домен> — проверить доступность сайта по всему миру\n"
@@ -275,7 +302,7 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user.username or user.username.lower() != CREATOR_USERNAME.lower():
         await update.message.reply_text("У вас нет прав администратора.")
         return
-    
+
     text = (
         "🔧 **Админ-меню**\n\n"
         "Доступные команды:\n"
@@ -290,7 +317,7 @@ async def blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user.username or user.username.lower() != CREATOR_USERNAME.lower():
         await update.message.reply_text("У вас нет прав администратора.")
         return
-    
+
     blocked = load_blocked()
     if not blocked:
         await update.message.reply_text("Список заблокированных сервисов пуст.")
@@ -303,11 +330,11 @@ async def blockadd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user.username or user.username.lower() != CREATOR_USERNAME.lower():
         await update.message.reply_text("У вас нет прав администратора.")
         return
-    
+
     if not context.args:
         await update.message.reply_text("Укажите домен. Пример: /blockadd telegram.org")
         return
-    
+
     domain = context.args[0].lower().strip()
     blocked = load_blocked()
     if domain not in blocked:
@@ -322,11 +349,11 @@ async def blockdel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user.username or user.username.lower() != CREATOR_USERNAME.lower():
         await update.message.reply_text("У вас нет прав администратора.")
         return
-    
+
     if not context.args:
         await update.message.reply_text("Укажите домен. Пример: /blockdel telegram.org")
         return
-    
+
     domain = context.args[0].lower().strip()
     blocked = load_blocked()
     if domain in blocked:
@@ -336,7 +363,6 @@ async def blockdel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"❌ Домен {domain} не найден в списке.")
 
-# ---------- Запуск бота ----------
 def run_bot():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -345,6 +371,6 @@ def run_bot():
     app.add_handler(CommandHandler("blocklist", blocklist))
     app.add_handler(CommandHandler("blockadd", blockadd))
     app.add_handler(CommandHandler("blockdel", blockdel))
-    
+
     logger.info("🤖 Бот запущен и слушает команды...")
     app.run_polling()
